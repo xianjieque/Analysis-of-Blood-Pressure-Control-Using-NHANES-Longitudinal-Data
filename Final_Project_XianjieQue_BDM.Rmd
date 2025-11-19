@@ -1,0 +1,1229 @@
+---
+title: "Final_Project_XianjieQue_BDM"
+author: "XianjieQue"
+date: "2025-04-14"
+output:
+  html_document:
+    number_sections: yes
+    toc: true        
+    toc_depth: 3     
+    toc_float: true  
+    theme: cerulean
+    keep_md: yes
+---
+
+# load packages
+
+```{r load packages}
+library(dplyr)
+library(ggplot2)
+# install.packages("survey")
+library(survey)
+# install.packages("Amelia")
+library(Amelia)
+library(VIM)
+library(ncvreg)
+library(caret)
+library(glmnet)
+library(pROC)
+library(rlang)
+# install.packages("gt")
+library(gt)
+```
+
+# read dataset
+
+```{r read dataset}
+prep <- read.csv("Preprocessed_data.csv")
+str(prep)
+
+demogra <- read.csv("Variable Dictionary/nhanes_Demographics_variables.csv")
+str(demogra)
+
+dietary <- read.csv("Variable Dictionary/nhanes_Dietary_variables.csv")
+str(dietary)
+
+lab <- read.csv("Variable Dictionary/nhanes_Laboratory_variables.csv")
+str(lab)
+
+exam <- read.csv("Variable Dictionary/nhanes_examination_variables.csv")
+str(exam)
+
+ques <- read.csv("Variable Dictionary/nhanes_Questionnaire_variables.csv")
+str(ques)
+```
+
+## add time variable "phase"
+
+```{r}
+# save a raw data
+prep_raw <- prep
+
+# check how many obs are with hypertension
+table(prep$htn_accaha)
+# actually all obs are "Yes"
+
+# Add time variable as a covariate 
+prep$phase <- ifelse(prep$Begin_Year >= "2013", "Falling", "Rising")
+prep$phase <- relevel(factor(prep$phase), ref = "Rising")  
+# change reference to "Rising" ("Before2013")
+
+prep$phase <- as.factor(prep$phase)
+
+prep$bp_control_accaha <- ifelse(prep$bp_control_accaha %in% c("Yes", 1), 1,
+                              ifelse(prep$bp_control_accaha %in% c("No", 0), 0, NA))
+```
+
+## clean_fake_missing
+
+```{r clean_fake_missing}
+clean_fake_missing <- function(df,
+                                missing_strings = c("", " ", "NA", "N/A", "Refused", "Don't know"),
+                                missing_numbers = c(7, 9, 77, 88, 99, 777, 888, 999, 7777, 8888, 9999),
+                                verbose = TRUE,
+                                save_csv = TRUE,
+                                csv_path = "cleaned_data.csv") {
+  df_cleaned <- df  
+
+  for (col_name in names(df_cleaned)) {
+    col <- df_cleaned[[col_name]]
+
+    # for character
+    if (is.character(col) || is.factor(col)) {
+      before <- sum(is.na(col))
+      col <- as.character(col)
+      col[col %in% missing_strings] <- NA
+      after <- sum(is.na(col))
+      if (verbose && (after > before)) {
+        cat(sprintf("Character cleaned: %-20s | NA: %d ➜ %d\n", col_name, before, after))
+      }
+      df_cleaned[[col_name]] <- col
+    }
+
+    # for numberic
+    if (is.numeric(col) || is.integer(col)) {
+      before <- sum(is.na(col))
+      col[col %in% missing_numbers] <- NA
+      after <- sum(is.na(col))
+      if (verbose && (after > before)) {
+        cat(sprintf("Numeric  cleaned: %-20s | NA: %d ➜ %d\n", col_name, before, after))
+      }
+      df_cleaned[[col_name]] <- col
+    }
+  }
+
+  if (save_csv) {
+    write.csv(df_cleaned, file = csv_path, row.names = FALSE)
+    if (verbose) cat(sprintf("\n Cleaned data saved to: %s\n", csv_path))
+  }
+  
+  return(df_cleaned)
+}
+
+prep <- clean_fake_missing(prep, csv_path = "prep_cleaned.csv")
+```
+
+### check "chol_" variables
+
+```{r check "chol_" variables}
+chol_vars <- grep("^chol_", names(prep), value = TRUE)
+length(chol_vars) # 41
+
+missing_rates <- sapply(prep[chol_vars], function(col) {
+  mean(is.na(col))
+})
+
+range(missing_rates) # 0.5777927 0.5934896
+
+# transform to a data.frame and order by missing rate (descending)
+missing_df <- data.frame(
+  Variable = names(missing_rates),
+  MissingRate = missing_rates
+) %>%
+  arrange(desc(MissingRate))
+
+print(missing_df)
+```
+
+## split into two subsets based on chol == 0
+
+```{r split into two subsets}
+prep_chol <- subset(prep, svy_subpop_chol == 1) # 11118, 161
+prep_no_chol <- subset(prep, svy_subpop_chol == 0) # 15639, 161
+```
+
+# prep_chol
+
+## unit conversions pair and keep SI only
+
+```{r check unit_conversion_pairs}
+get_unit_conversion_pairs <- function(data) {
+  var_names <- names(data)
+  lbx_vars <- grep("^LBX", var_names, value = TRUE)
+  lbd_vars <- grep("^LBD", var_names, value = TRUE)
+  
+  get_core <- function(var) {
+    core <- sub("^LBX", "", var)
+    core <- sub("_[A-Za-z0-9]+$", "", core)
+    return(core)
+  }
+  
+  matched_pairs <- list()
+  
+  for (lbx in lbx_vars) {
+    core <- get_core(lbx)
+    matched <- grep(paste0("^LBD", core), lbd_vars, value = TRUE)
+    if (length(matched) > 0) {
+      matched_pairs[[length(matched_pairs) + 1]] <- c(lbx, matched[1])
+    }
+  }
+  
+  # output a data.frame
+  matched_df <- do.call(rbind, matched_pairs)
+  colnames(matched_df) <- c("LBX_variable", "LBD_variable")
+  return(as.data.frame(matched_df, stringsAsFactors = FALSE))
+}
+
+matched_unit_pairs <- get_unit_conversion_pairs(prep_chol)
+View(matched_unit_pairs) 
+```
+
+```{r check correlation coefficient}
+cor_results <- data.frame(
+  LBX_variable = character(),
+  LBD_variable = character(),
+  correlation = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# calculate correlation coefficient
+for (i in 1:nrow(matched_unit_pairs)) {
+  lbx <- matched_unit_pairs$LBX_variable[i]
+  lbd <- matched_unit_pairs$LBD_variable[i]
+  
+  if (all(c(lbx, lbd) %in% names(prep))) {
+    r <- cor(prep[[lbx]], prep[[lbd]], use = "pairwise.complete.obs")
+    cor_results <- rbind(cor_results, data.frame(
+      LBX_variable = lbx,
+      LBD_variable = lbd,
+      correlation = round(r, 6),
+      stringsAsFactors = FALSE
+    ))
+  } else {
+    warning(paste("Missing variable in prep:", lbx, "or", lbd))
+  }
+}
+
+cor_results
+```
+
+### keep SI only
+
+```{r keep SI only}
+prep_chol <- prep_chol %>% select(-LBXSTP, -LBXSTR_x, -LBXSUA, -LBXSGB, -LBXSTR_y) # 11118, 156
+```
+
+## collinear >= 0.95 variables 
+
+The variables (or variable with levels) LBDSTPSI, LBDSGBSI, SDDSRVYR, LBXGH, LBXSTR_y are perfectly collinear with another variable in the data.
+
+```{r collinear greater than 0.95}
+# Step 1: Select all continuous variables (numeric) in prep
+numeric_vars <- prep_chol[, sapply(prep_chol, is.numeric)]
+
+# Step 2: Compute the correlation matrix between variables (ignoring missing values)
+cor_matrix <- cor(numeric_vars, use = "pairwise.complete.obs")
+
+# Step 3: Find pairs of variables with |correlation coefficient| >= 0.95 
+collinear_pairs <- which(abs(cor_matrix) >= 0.95 & lower.tri(cor_matrix), arr.ind = TRUE)
+
+# Step 4: Display completely collinear pairs of variable names
+collinear_vars <- data.frame(
+  var1 = rownames(cor_matrix)[collinear_pairs[, 1]],
+  var2 = colnames(cor_matrix)[collinear_pairs[, 2]],
+  r = cor_matrix[collinear_pairs]
+)
+
+print(collinear_vars)
+write.csv(collinear_vars, "collinear_vars_0.95_prep_chol.csv", row.names = FALSE)
+```
+
+```{r compare LBXHCT with LBXHGB, eval=FALSE}
+# calculate the correlation
+r_hct <- cor(prep_chol$LBXHCT, prep_chol$bp_control_accaha, use = "complete.obs")
+r_hgb <- cor(prep_chol$LBXHGB, prep_chol$bp_control_accaha, use = "complete.obs")
+
+# print
+cat("Correlation with bp_control_accaha:\n")
+cat("LBXHCT:", round(r_hct, 4), "\n")
+cat("LBXHGB:", round(r_hgb, 4), "\n")
+```
+
+### get_description
+
+```{r get_description, eval=FALSE}
+get_description <- function(varname, df) {
+  result <- df %>%
+    filter(Variable.Name == varname)
+  new_name <- paste0(varname, "_descrip")
+  assign(new_name, result, envir = .GlobalEnv)
+}
+
+get_description("WTMEC2YR", demogra)
+get_description("svy_weight_mec", demogra)
+get_description("LBXTC", lab)
+get_description("chol_ldl", dietary)
+get_description("LBDSTPSI", lab)
+get_description("LBXSTR_x", lab)
+get_description("BPAARM", exam)
+```
+
+### compare variables collinear = 1 
+
+```{r compare variables collinear equals to 1, eval=FALSE}
+# prep[, c("LBXGH", "cc_hba1c")]
+
+compare_collinear_vars <- function(data, var_pairs_df, print_n = TRUE) {
+  results <- list()
+  
+  for (i in seq_len(nrow(var_pairs_df))) {
+    col1 <- var_pairs_df$var1[i]
+    col2 <- var_pairs_df$var2[i]
+   
+    if (!(col1 %in% names(data)) | !(col2 %in% names(data))) {
+      warning("One of the columns not found: ", col1, " or ", col2)
+      next
+    }
+    
+    unequal_or_mismatched_na <- which(
+      is.na(data[[col1]]) != is.na(data[[col2]]) |
+      (!is.na(data[[col1]]) & !is.na(data[[col2]]) & data[[col1]] != data[[col2]])
+    )
+    
+    mismatch_df <- data[unequal_or_mismatched_na, c(col1, col2)]
+    
+    if (print_n) {
+      message(length(unequal_or_mismatched_na), 
+              " row(s) where '", col1, "' and '", col2, "' are unequal or NA-mismatched.")
+    }
+    
+    results[[paste(col1, col2, sep = "_vs_")]] <- mismatch_df
+  }
+  
+  return(results)
+}
+
+results_collinear <- compare_collinear_vars(prep_chol, collinear_vars)
+
+names(results_collinear)  
+
+# results_collinear[["LBDSGBSI_vs_LBXSGB"]]  
+
+# all.equal(prep$LBXSTP, prep$LBDSTPSI / 10) # LBDSTP derived by dividing LBDSTPSI by 10
+```
+
+## delete variables collinear >= 0.95
+
+```{r delete variables collinear greater than 0.95}
+# delete collinear >= 0.95 variables 
+prep_chol_1 <- prep_chol %>% select(-svy_weight_mec, -svy_strata, -svy_psu, -Begin_Year, -Survey_Year, -YEAR, -SDDSRVYR, -WTMEC2YR, -WTINT2YR, -SDMVPSU, -SDMVSTRA, -RIDAGEYR, -BPXSY1, -BPXSY2, -BPXSY3, -bp_sys_mean, -LBXSCH, -chol_total, -LBDHDL, -LBDLDL, -chol_ldl, -FriedewaldLDL, -LBDSTRSI, -LBXGH, -LBXHGB)
+
+# delete other BP variables
+prep_chol_1 <- prep_chol_1 %>% select(-BPXDI1, -BPXDI2, -BPXDI3, -bp_dia_mean) # 11118, 127
+
+# prep_chol[, c("LBXSCH", "LBXTC")]
+```
+
+## delete variables that do not vary
+
+```{r delete variables that do not vary}
+constant_vars <- names(prep_chol_1)[sapply(prep_chol_1, function(col) {
+  length(unique(na.omit(col))) == 1
+})]
+
+print(constant_vars) 
+
+# svy_subpop_chol      htn_accaha        RIDSTATR 
+#            "1"           "Yes"             "2" 
+
+sapply(prep_chol_1[constant_vars], function(x) unique(na.omit(x)))
+
+write.csv(data.frame(Constant_Variables = constant_vars),
+          "constant_vars_removed_prep_chol.csv", row.names = FALSE)
+
+prep_chol_1 <- prep_chol_1[, !(names(prep_chol_1) %in% constant_vars)] # 11118, 124
+```
+
+## delete variables that barely change (e.g., a value that accounts for 99% of all variables)
+
+```{r delete variables that barely change}
+# set threshold
+dominant_threshold <- 0.99
+
+# filter variables that barely change
+low_variability_vars <- names(prep_chol_1)[sapply(prep_chol_1, function(col) {
+  non_missing <- na.omit(col)
+  if (length(non_missing) == 0) return(FALSE)
+  max_prop <- max(table(non_missing)) / length(non_missing)
+  return(max_prop >= dominant_threshold)
+})]
+
+print(low_variability_vars)
+
+# View the dominant values and proportions of these variables
+sapply(prep_chol_1[low_variability_vars], function(x) {
+  non_missing <- na.omit(x)
+  top_val <- names(sort(table(non_missing), decreasing = TRUE))[1]
+  top_prop <- max(table(non_missing)) / length(non_missing)
+  paste0("Most frequent value: ", top_val, " (", round(top_prop * 100, 2), "%)")
+})
+
+# delete 6 variables
+prep_chol_1 <- prep_chol_1 %>% select(-chol_med_pcsk9i, -chol_med_bile, -chol_med_pitavastatin, -chol_med_fluvastatin, -chol_med_other, -BPAARM) # 11118, 118
+```
+
+## missing value
+
+```{r missing value}
+# Step 1: calculate the ratio
+na_ratios <- sapply(prep_chol_1, function(col) mean(is.na(col)))
+no_missing_cols <- names(na_ratios[na_ratios == 0])  # columns don't have NA
+prep_chol_fixed <- prep_chol_1[, no_missing_cols] # 43
+
+na_ratios <- na_ratios[na_ratios > 0]  # 75
+
+# bins
+bins <- cut(na_ratios, breaks = seq(0, 1, by = 0.1), include.lowest = TRUE, right = FALSE)
+bin_counts <- table(bins)
+
+# plot
+ggplot(data.frame(bin = names(bin_counts), count = as.vector(bin_counts)), aes(x = bin, y = count)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+  labs(title = "Missing Value Proportion Histogram for prep_chol",
+       x = "Missing Rate Bin", y = "Number of Columns") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Step 2: remove and retain columns
+threshold <- 0.5
+keep_cols <- names(na_ratios[na_ratios <= threshold])
+drop_cols <- names(na_ratios[na_ratios > threshold])
+
+kept_df <- data.frame(column = keep_cols, missing_rate = na_ratios[keep_cols]) # 75
+dropped_df <- data.frame(column = drop_cols, missing_rate = na_ratios[drop_cols]) # 0
+
+# save columns to csv
+write.csv(kept_df, "kept_columns_prep_chol.csv", row.names = FALSE) 
+write.csv(dropped_df, "dropped_columns_prep_chol.csv", row.names = FALSE) 
+
+# Step 3: check continuous columns and categorical variables
+prep_chol_kept <- prep_chol_1[, keep_cols] # 75
+
+num_continuous <- sum(sapply(prep_chol_kept, is.numeric))
+num_categorical <- sum(sapply(prep_chol_kept, function(col) is.factor(col) || is.character(col)))
+
+cat("Number of continuous variables: ", num_continuous, "\n") # 64
+cat("Number of categorical variables: ", num_categorical, "\n") # 11
+```
+
+
+## imputation NA
+
+Warning in amcheck(x = x, m = m, idvars = numopts$idvars, priors = priors,  :
+  The variable LBXTC is perfectly collinear with another variable in the data.
+  
+The resulting variance matrix was not invertible.   Please check your data for highly collinear variables.
+
+```{r imputation NA}
+# Step 1: split continuous and categorical
+prep_cont <- prep_chol_kept[, sapply(prep_chol_kept, is.numeric)]
+prep_cat  <- prep_chol_kept[, sapply(prep_chol_kept, function(x) is.factor(x) || is.character(x))]
+
+prep_cont <- prep_cont %>% select(-chol_nonhdl)
+
+# Step 2: EM imputation for continuous variables
+amelia_result <- amelia(prep_cont, m = 1)  # advanced method: m = 5
+cont_imputed <- amelia_result$imputations[[1]]
+
+# Step 3: KNN imputation for categorical variables
+cat_imputed <- kNN(prep_cat, k = 5, imp_var = FALSE)
+
+# Step 4: combine
+prep_chol_imputed <- cbind(cont_imputed, cat_imputed, prep_chol_fixed) # 11118, 117
+```
+
+### check "LBXTC"
+
+```{r check "LBXTC", eval=FALSE}
+# Step 1: Extract non-missing rows containing "LBXTC"
+df_non_na <- prep_cont %>% filter(!is.na(LBXTC))
+
+# Step 2: Calculate the correlation coefficient with "LBXTC"
+cor_vals <- sapply(df_non_na, function(x) {
+  if (is.numeric(x)) cor(x, df_non_na$LBXTC, use = "complete.obs") else NA
+})
+
+# Step 3: Find variables with absolute value >= 0.9
+collinear_vars_1 <- names(which(abs(cor_vals) >= 0.9 & names(cor_vals) != "LBXTC"))
+
+# View Results
+print(collinear_vars_1)
+```
+
+## collinear > 0.8 before Lasso and Logistics
+
+```{r collinear greater than 0.8 before Lasso and Logistics}
+# Step 1: Select all continuous variables (numeric) in prep_chol
+numeric_vars <- prep_chol_imputed[, sapply(prep_chol_imputed, is.numeric)]
+
+# Step 2: Compute the correlation matrix between variables (ignoring missing values)
+cor_matrix <- cor(numeric_vars, use = "pairwise.complete.obs")
+
+# Step 3: Find pairs of variables with |correlation coefficient| >= 0.8 
+collinear_pairs <- which(abs(cor_matrix) >= 0.8 & lower.tri(cor_matrix), arr.ind = TRUE)
+
+# Step 4: Display completely collinear pairs of variable names
+collinear_vars <- data.frame(
+  var1 = rownames(cor_matrix)[collinear_pairs[, 1]],
+  var2 = colnames(cor_matrix)[collinear_pairs[, 2]],
+  r = cor_matrix[collinear_pairs]
+)
+
+print(collinear_vars)
+write.csv(collinear_vars, "collinear_vars_0.8_prep_chol.csv", row.names = FALSE)
+```
+
+## delete variables collinear >= 0.8
+
+```{r delete variables collinear greater than 0.8}
+# delete collinear >= 0.8 variables 
+prep_chol_imputed <- prep_chol_imputed %>% select(-URXUMA, -LBXSGL, -ldl_corrected, -BMXWT, -BMXARMC, -BPACSZ, -LBXLYPCT, -LBXRBCSI)
+
+# keep: LBXTC, cc_acr, cc_hba1c, BMXBMI, BMXWAIST, LBXNEPCT, LBXHCT
+
+# head(prep_imputed[, c("LBXSCH", "LBXTC")], 20)
+
+sum(is.na(prep_chol_imputed)) # 11118, 109
+```
+
+## Lasso to full dataset with interaction
+
+```{r Lasso to full dataset with interaction}
+prep_chol_imputed_2 <- prep_chol_imputed %>% select(-svy_id)  # 11118, 108
+
+prep_chol_imputed_2$phase <- relevel(factor(prep_chol_imputed_2$phase), ref = "Rising")
+
+# LASSO pipeline with interactions (excluding main effect of phase)
+run_lasso_with_interaction <- function(data,
+                                     response_var = "bp_control_accaha",
+                                     save_dir = ".",
+                                     dataset_name = "prep_chol_full") {
+  set.seed(123)
+
+  # Ensure phase is factor with correct reference level
+  data$phase <- relevel(factor(data$phase), ref = "Rising")
+
+  # Step 1: Prepare predictors (exclude response and phase)
+  predictors <- setdiff(names(data), c(response_var, "phase"))
+
+  # Step 2: Construct formula with interactions
+  main_effects <- paste(predictors, collapse = " + ")
+  interaction_terms <- paste(paste0(predictors, ":phase"), collapse = " + ")
+  formula_string <- paste(response_var, "~", main_effects, "+", interaction_terms)
+
+  # Step 3: Create full design matrix
+  design_matrix <- model.matrix(as.formula(formula_string), data = data)[, -1]
+  response <- data[[response_var]]
+
+  # Step 4: Train/test split
+  train_idx <- sample(1:nrow(data), 0.7 * nrow(data))
+  x_train <- design_matrix[train_idx, ]
+  y_train <- response[train_idx]
+  x_test <- design_matrix[-train_idx, ]
+  y_test <- response[-train_idx]
+
+  # Step 5: Cross-validation with fixed folds
+  foldid <- sample(rep(1:10, length.out = length(y_train)))
+  cvfit <- cv.glmnet(x = x_train, y = y_train, family = "binomial", alpha = 1, foldid = foldid)
+  best_lambda <- cvfit$lambda.min
+
+  # Step 6: Predict on test set
+  pred_prob <- as.vector(predict(cvfit, newx = x_test, s = best_lambda, type = "response"))
+  pred_class <- ifelse(pred_prob > 0.5, 1, 0)
+  acc <- mean(pred_class == y_test)
+  auc_val <- auc(roc(y_test, pred_prob))
+
+  # Step 7: Refit on full data using best lambda
+  final_model <- glmnet(x = design_matrix, y = response, family = "binomial", alpha = 1, lambda = best_lambda)
+  coef_final <- coef(final_model)
+  selected_vars <- rownames(coef_final)[which(coef_final != 0)]
+  selected_vars <- selected_vars[selected_vars != "(Intercept)"]
+
+  # Step 8: Save results
+  results_df <- data.frame(variable = selected_vars)
+  summary_df <- data.frame(metric = c("accuracy", "auc"), value = c(acc, auc_val))
+
+  write.csv(results_df, file = file.path(save_dir, paste0("lasso_selected_", dataset_name, ".csv")), row.names = FALSE)
+  write.csv(summary_df, file = file.path(save_dir, paste0("lasso_summary_", dataset_name, ".csv")), row.names = FALSE)
+
+  # Step 9: Save plots
+  png(filename = file.path(save_dir, paste0("cv_curve_", dataset_name, ".png")), width = 800, height = 600)
+  plot(cvfit, main = paste("LASSO CV -", dataset_name))
+  dev.off()
+
+  png(filename = file.path(save_dir, paste0("auc_curve_", dataset_name, ".png")), width = 800, height = 600)
+  plot(roc(y_test, pred_prob), main = paste("AUC ROC -", dataset_name), col = "blue", lwd = 2)
+  dev.off()
+
+  # Step 10: Return
+  return(list(model = final_model, selected = selected_vars, accuracy = acc, auc = auc_val))
+}
+
+result_lasso <- run_lasso_with_interaction(data = prep_chol_imputed_2)
+```
+
+## Build Logistic Regression Formula
+
+```{r Build Logistic Regression Formula}
+# Step 1: extract interaction terms
+lasso_selected_vars <- result_lasso[["selected"]]
+interaction_vars <- grep(":phase", lasso_selected_vars, value = TRUE)
+cat("interaction terms from Lasso: \n")
+print(interaction_vars)
+
+# Step 2: build logistic regression formula
+# main_effects <- unique(sub(":phase.*", "", interaction_vars))
+
+main_effects <- c("chol_trig", "LBDSPH", "LBDSCR", "cc_egfr_lt60", "cc_acr_gteq30", "demo_age_cat", "demo_race", "htn_resistant_jnc7", "htn_resistant_jnc7_thz", "chol_nonhdl_5cat", "chol_med_rosuvastatin", "chol_med_addon_use", "cc_diabetes")
+
+interaction_vars_2 <- paste0(main_effects, ":phase")
+
+# all_vars<- unique(c(main_effects, interaction_vars_2))
+# formula_str <- paste("bp_control_accaha ~", paste(all_vars, collapse = " + "))
+formula_str <- paste("bp_control_accaha ~", paste(interaction_vars_2, collapse = " + "))
+formula_obj <- as.formula(formula_str)
+```
+
+## Logistic with weight
+
+Logistics with survey weights, using svyglm(), is intended to make inferences about the population, and representativeness needs to be considered.
+
+```{r Logistic with weight}
+prep_svy <- prep_chol_imputed %>%
+  left_join(prep_chol %>% select(svy_id, svy_strata, svy_psu, svy_weight_mec), by = "svy_id")
+
+prep_svy <- prep_svy %>%
+  filter(!is.na(svy_psu) & !is.na(svy_strata) & !is.na(svy_weight_mec))
+
+prep_svy <- prep_svy %>%
+  mutate(bp_control_accaha = as.integer(bp_control_accaha))
+
+design <- svydesign(ids = ~svy_psu,
+                       strata = ~svy_strata,
+                       weights = ~svy_weight_mec,
+                       nest = TRUE,
+                       data = prep_svy)
+
+fit_svy <- svyglm(formula_obj,
+                     design = design,
+                     family = binomial())
+
+summary(fit_svy)
+
+# save summary
+summary_df_svy <- summary(fit_svy)$coefficients
+summary_df_svy <- as.data.frame(summary_df_svy)
+summary_df_svy$Variable <- rownames(summary_df_svy)
+rownames(summary_df_svy) <- NULL
+summary_df_svy <- summary_df_svy[, c("Variable", "Estimate", "Std. Error", "t value", "Pr(>|t|)")]
+
+write.csv(summary_df_svy, "logistic_results_svyglm_interactions.csv", row.names = FALSE)
+cat("Survey-weighted logistic summary saved as logistic_results_svyglm_interactions.csv\n")
+
+# generate a table
+signif_results <- summary_df_svy %>%
+  filter(Variable != "(Intercept)", `Pr(>|t|)` <= 0.05) %>%
+  arrange(`Pr(>|t|)`) %>%
+  slice_head(n = 15)
+
+table_with <- signif_results %>%
+  gt() %>%
+  fmt_number(columns = c("Estimate", "Std. Error", "t value", "Pr(>|t|)"),
+             decimals = 4) %>%
+  tab_header(
+    title = "Significant Variables Selected from Subset with Cholesterol Data",
+    subtitle = "Variables with p ≤ 0.05"
+  )
+
+gtsave(table_with, filename = "significant_vars_table.png")
+```
+
+## trend plot
+
+```{r trend plot}
+df <- prep_chol_imputed %>%
+  inner_join(prep_chol %>% select(Begin_Year, svy_id), by = "svy_id")
+
+continuous_vars <- c("chol_trig", "LBDSPH", "LBDSCR")
+
+categorical_vars <- c("cc_egfr_lt60", "cc_acr_gteq30", "demo_age_cat", "demo_race", "htn_resistant_jnc7", "htn_resistant_jnc7_thz", "chol_nonhdl_5cat", "chol_med_rosuvastatin", "chol_med_addon_use", "cc_diabetes")
+
+# Create a save directory
+output_dir <- "trend_plots_by_year"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Continuous variables: mean for each year
+for (var in continuous_vars) {
+  p <- df %>%
+    group_by(Begin_Year) %>%
+    summarise(mean_val = mean(.data[[var]], na.rm = TRUE)) %>%
+    ggplot(aes(x = Begin_Year, y = mean_val)) +
+    geom_line(color = "black") +
+    geom_point() +
+    geom_vline(xintercept = 2013, linetype = "dashed", color = "red") +
+    labs(title = paste("Trend of", var), y = "Mean", x = "Begin Year") +
+    theme_minimal()
+
+  ggsave(file.path(output_dir, paste0("trend_", var, ".png")), plot = p, width = 6, height = 4)
+}
+
+# Categorical variables: the proportion of each level in each year
+for (var in categorical_vars) {
+  df[[var]] <- as.factor(df[[var]])
+  
+  if (var %in% c("demo_age_cat", "chol_nonhdl_5cat", "demo_race")) {
+    levels_list <- levels(df[[var]])
+    
+    for (lvl in levels_list) {
+      trend_df <- df %>%
+        filter(!is.na(.data[[var]])) %>%
+        mutate(level_match = (.data[[var]] == lvl)) %>%
+        group_by(Begin_Year) %>%
+        summarise(prop = mean(level_match, na.rm = TRUE))
+      
+      p <- ggplot(trend_df, aes(x = Begin_Year, y = prop)) +
+        geom_line(color = "black") +
+        geom_point() +
+        geom_vline(xintercept = 2013, linetype = "dashed", color = "red") +
+        labs(title = paste("Proportion of", lvl, "in", var), y = "Proportion", x = "Begin Year") +
+        theme_minimal()
+      
+      filename <- paste0("trend_", var, "_", gsub("[^a-zA-Z0-9]", "_", lvl), ".png")
+      ggsave(file.path(output_dir, filename), plot = p, width = 6, height = 4)
+    }
+    
+  } else {
+    p <- df %>%
+      filter(!is.na(.data[[var]])) %>%
+      group_by(Begin_Year, !!sym(var)) %>%
+      summarise(n = n(), .groups = "drop") %>%
+      group_by(Begin_Year) %>%
+      mutate(prop = n / sum(n)) %>%
+      ggplot(aes(x = Begin_Year, y = prop, color = !!sym(var))) +
+      geom_line() +
+      geom_point() +
+      geom_vline(xintercept = 2013, linetype = "dashed", color = "red") +
+      labs(title = paste("Proportion of", var, "by Year"), y = "Proportion", x = "Begin Year") +
+      theme_minimal()
+    
+    ggsave(file.path(output_dir, paste0("trend_", var, ".png")), plot = p, width = 6, height = 4)
+  }  
+}
+```
+
+
+# prep_no_chol
+
+## unit conversions pair and keep SI only
+
+```{r check unit_conversion_pairs no}
+get_unit_conversion_pairs <- function(data) {
+  var_names <- names(data)
+  lbx_vars <- grep("^LBX", var_names, value = TRUE)
+  lbd_vars <- grep("^LBD", var_names, value = TRUE)
+  
+  get_core <- function(var) {
+    core <- sub("^LBX", "", var)
+    core <- sub("_[A-Za-z0-9]+$", "", core)
+    return(core)
+  }
+  
+  matched_pairs <- list()
+  
+  for (lbx in lbx_vars) {
+    core <- get_core(lbx)
+    matched <- grep(paste0("^LBD", core), lbd_vars, value = TRUE)
+    if (length(matched) > 0) {
+      matched_pairs[[length(matched_pairs) + 1]] <- c(lbx, matched[1])
+    }
+  }
+  
+  # output a data.frame
+  matched_df <- do.call(rbind, matched_pairs)
+  colnames(matched_df) <- c("LBX_variable", "LBD_variable")
+  return(as.data.frame(matched_df, stringsAsFactors = FALSE))
+}
+
+matched_unit_pairs_no <- get_unit_conversion_pairs(prep_no_chol)
+View(matched_unit_pairs_no) 
+```
+
+```{r check correlation coefficient_no}
+cor_results <- data.frame(
+  LBX_variable = character(),
+  LBD_variable = character(),
+  correlation = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# calculate correlation coefficient
+for (i in 1:nrow(matched_unit_pairs)) {
+  lbx <- matched_unit_pairs$LBX_variable[i]
+  lbd <- matched_unit_pairs$LBD_variable[i]
+  
+  if (all(c(lbx, lbd) %in% names(prep))) {
+    r <- cor(prep[[lbx]], prep[[lbd]], use = "pairwise.complete.obs")
+    cor_results <- rbind(cor_results, data.frame(
+      LBX_variable = lbx,
+      LBD_variable = lbd,
+      correlation = round(r, 6),
+      stringsAsFactors = FALSE
+    ))
+  } else {
+    warning(paste("Missing variable in prep:", lbx, "or", lbd))
+  }
+}
+
+cor_results
+```
+
+### keep SI only_no
+
+```{r keep SI only_no}
+prep_no_chol <- prep_no_chol %>% select(-LBXSTP, -LBXSTR_x, -LBXSUA, -LBXSGB, -LBXSTR_y) # 15639, 156
+```
+
+## collinear >= 0.95 variables 
+
+The variables (or variable with levels) LBDSTPSI, LBDSGBSI, SDDSRVYR, LBXGH, LBXSTR_y are perfectly collinear with another variable in the data.
+
+```{r collinear greater than 0.95 no}
+# Step 1: Select all continuous variables (numeric) in prep
+numeric_vars_no <- prep_no_chol[, sapply(prep_no_chol, is.numeric)]
+
+# Step 2: Compute the correlation matrix between variables (ignoring missing values)
+cor_matrix_no <- cor(numeric_vars_no, use = "pairwise.complete.obs")
+
+# Step 3: Find pairs of variables with |correlation coefficient| >= 0.95 
+collinear_pairs_no <- which(abs(cor_matrix_no) >= 0.95 & lower.tri(cor_matrix_no), arr.ind = TRUE)
+
+# Step 4: Display completely collinear pairs of variable names
+collinear_vars_no <- data.frame(
+  var1 = rownames(cor_matrix_no)[collinear_pairs_no[, 1]],
+  var2 = colnames(cor_matrix_no)[collinear_pairs_no[, 2]],
+  r = cor_matrix_no[collinear_pairs_no]
+)
+
+print(collinear_vars_no)
+write.csv(collinear_vars_no, "collinear_vars_0.95_prep_no_chol.csv", row.names = FALSE)
+```
+
+## delete variables collinear >= 0.95
+
+```{r delete variables collinear greater than 0.95 no}
+# delete collinear >= 0.95 variables 
+prep_no_chol_1 <- prep_no_chol %>% select(-svy_weight_mec, -svy_strata, -svy_psu, -Begin_Year, -Survey_Year, -YEAR, -SDDSRVYR, -SDMVSTRA, -WTMEC2YR, -WTINT2YR, -SDMVPSU, -RIDAGEYR, -BPXSY1, -BPXSY2, -BPXSY3, -bp_sys_mean, -LBXSCH, -chol_total, -chol_hdl, -LBDLDL, -chol_ldl, -FriedewaldLDL, -chol_trig, -LBXGH, -LBXHGB) 
+
+# delete other BP variables
+prep_no_chol_1 <- prep_no_chol_1 %>% select(-BPXDI1, -BPXDI2, -BPXDI3, -bp_dia_mean) # 15639, 127
+
+# prep_no_chol[, c("LBXSCH", "LBXTC")]
+```
+
+## delete variables that do not vary
+
+```{r delete variables that do not vary no}
+constant_vars_no <- names(prep_no_chol_1)[sapply(prep_no_chol_1, function(col) {
+  length(unique(na.omit(col))) == 1
+})]
+
+print(constant_vars_no)  # 10 variables
+
+#      svy_subpop_chol            htn_accaha 
+#                  "0"                 "Yes" 
+#    chol_ldl_gteq_190   chol_ldl_persistent 
+#                 "No"                  "No" 
+# chol_nonhdl_gteq_220       chol_med_pcsk9i 
+#                 "No"                  "No" 
+#        chol_med_bile chol_med_pitavastatin 
+#                 "No"                  "No" 
+# chol_med_fluvastatin              RIDSTATR 
+#                 "No"                   "2" 
+
+sapply(prep_no_chol_1[constant_vars_no], function(x) unique(na.omit(x)))
+
+write.csv(data.frame(Constant_Variables = constant_vars_no),
+          "constant_vars_removed_prep_no_chol.csv", row.names = FALSE)
+
+prep_no_chol_1 <- prep_no_chol_1[, !(names(prep_no_chol_1) %in% constant_vars_no)] # 15639, 117
+```
+
+## delete variables that barely change (e.g., a value that accounts for 99% of all variables)
+
+```{r delete variables that barely change no}
+# set threshold
+dominant_threshold <- 0.99
+
+# filter variables that barely change
+low_variability_vars_no <- names(prep_no_chol_1)[sapply(prep_no_chol_1, function(col) {
+  non_missing <- na.omit(col)
+  if (length(non_missing) == 0) return(FALSE)
+  max_prop <- max(table(non_missing)) / length(non_missing)
+  return(max_prop >= dominant_threshold)
+})]
+
+print(low_variability_vars_no)
+
+# View the dominant values and proportions of these variables
+sapply(prep_no_chol_1[low_variability_vars_no], function(x) {
+  non_missing <- na.omit(x)
+  top_val <- names(sort(table(non_missing), decreasing = TRUE))[1]
+  top_prop <- max(table(non_missing)) / length(non_missing)
+  paste0("Most frequent value: ", top_val, " (", round(top_prop * 100, 2), "%)")
+})
+
+# delete 1 variable
+prep_no_chol_1 <- prep_no_chol_1 %>% select(-BPAARM) # 15639, 116
+
+#                            BPAARM 
+# "Most frequent value: 1 (99.08%)" 
+```
+
+## missing value
+
+```{r missing value no}
+# Step 1: calculate the ratio
+na_ratios_no <- sapply(prep_no_chol_1, function(col) mean(is.na(col)))
+no_missing_cols_no <- names(na_ratios_no[na_ratios_no == 0])  # columns don't have NA
+prep_no_chol_fixed <- prep_no_chol_1[, no_missing_cols_no] # 15
+
+na_ratios_no <- na_ratios_no[na_ratios_no > 0]  # 101
+
+# bins
+bins <- cut(na_ratios_no, breaks = seq(0, 1, by = 0.1), include.lowest = TRUE, right = FALSE)
+bin_counts <- table(bins)
+
+# plot
+ggplot(data.frame(bin = names(bin_counts), count = as.vector(bin_counts)), aes(x = bin, y = count)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+  labs(title = "Missing Value Proportion Histogram for prep_no_chol",
+       x = "Missing Rate Bin", y = "Number of Columns") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Step 2: remove and retain columns
+threshold <- 0.5
+keep_cols_no <- names(na_ratios_no[na_ratios_no <= threshold]) # 68
+drop_cols_no <- names(na_ratios_no[na_ratios_no > threshold]) # 33
+
+kept_df_no <- data.frame(column = keep_cols_no, missing_rate = na_ratios_no[keep_cols_no])
+dropped_df_no <- data.frame(column = drop_cols_no, missing_rate = na_ratios_no[drop_cols_no])
+
+# save columns to csv
+write.csv(kept_df_no, "kept_columns_prep_no_chol.csv", row.names = FALSE) # 68
+write.csv(dropped_df_no, "dropped_columns_prep_no_chol.csv", row.names = FALSE) # 33
+
+# Step 3: check continuous columns and categorical variables
+prep_no_chol_kept <- prep_no_chol_1[, keep_cols_no] # 68
+
+num_continuous_no <- sum(sapply(prep_no_chol_kept, is.numeric))
+num_categorical_no <- sum(sapply(prep_no_chol_kept, function(col) is.factor(col) || is.character(col)))
+
+cat("Number of continuous variables: ", num_continuous_no, "\n") # 61
+cat("Number of categorical variables: ", num_categorical_no, "\n") # 7
+```
+
+## imputation NA
+
+```{r imputation NA no}
+# Step 1: split continuous and categorical
+prep_no_cont <- prep_no_chol_kept[, sapply(prep_no_chol_kept, is.numeric)]
+prep_no_cat  <- prep_no_chol_kept[, sapply(prep_no_chol_kept, function(x) is.factor(x) || is.character(x))]
+
+# Step 2: EM imputation for continuous variables
+amelia_result_no <- amelia(prep_no_cont, m = 1)  # advanced method: m = 5
+cont_imputed_no <- amelia_result_no$imputations[[1]]
+
+# Step 3: KNN imputation for categorical variables
+cat_imputed_no <- kNN(prep_no_cat, k = 5, imp_var = FALSE)
+
+# Step 4: combine
+prep_no_chol_imputed <- cbind(cont_imputed_no, cat_imputed_no, prep_no_chol_fixed) # 15639, 83
+```
+
+## collinear > 0.8 before Lasso and Logistics
+
+```{r collinear greater than 0.8 before Lasso and Logistics no}
+# Step 1: Select all continuous variables (numeric) in prep_chol
+numeric_vars_no <- prep_no_chol_imputed[, sapply(prep_no_chol_imputed, is.numeric)]
+
+# Step 2: Compute the correlation matrix between variables (ignoring missing values)
+cor_matrix_no <- cor(numeric_vars_no, use = "pairwise.complete.obs")
+
+# Step 3: Find pairs of variables with |correlation coefficient| >= 0.8 
+collinear_pairs_no <- which(abs(cor_matrix_no) >= 0.8 & lower.tri(cor_matrix_no), arr.ind = TRUE)
+
+# Step 4: Display completely collinear pairs of variable names
+collinear_vars_no <- data.frame(
+  var1 = rownames(cor_matrix_no)[collinear_pairs_no[, 1]],
+  var2 = colnames(cor_matrix_no)[collinear_pairs_no[, 2]],
+  r = cor_matrix_no[collinear_pairs_no]
+)
+
+print(collinear_vars_no)
+write.csv(collinear_vars_no, "collinear_vars_0.8_prep_no_chol.csv", row.names = FALSE)
+```
+
+## delete variables collinear >= 0.8
+
+```{r delete variables collinear greater than 0.8 no}
+# delete collinear >= 0.8 variables 
+prep_no_chol_imputed <- prep_no_chol_imputed %>% select(-LBXSATSI, -BMXWT, -BMXARMC, -BPACSZ, -LBXLYPCT, -LBDEONO, -LBXRBCSI)
+
+# keep: LBXSASSI, BMXBMI, BMXWAIST, LBXNEPCT, LBXEOPCT, LBXHCT
+
+# head(prep_no_chol_imputed[, c("LBXSCH", "LBXTC")], 20)
+
+sum(is.na(prep_no_chol_imputed)) # 15639, 76
+```
+
+## Lasso to full dataset with interaction
+
+```{r Lasso to full dataset with interaction no}
+prep_no_chol_imputed_2 <- prep_no_chol_imputed %>% select(-svy_id)  # 15639, 75
+
+prep_no_chol_imputed_2$phase <- relevel(factor(prep_no_chol_imputed_2$phase), ref = "Rising")
+
+# LASSO pipeline with interactions (excluding "phase" main effect)
+run_lasso_with_interaction <- function(data,
+                                     response_var = "bp_control_accaha",
+                                     save_dir = ".",
+                                     dataset_name = "prep_no_chol_full") {
+  set.seed(123)
+
+  # Ensure phase is factor with correct reference level
+  data$phase <- relevel(factor(data$phase), ref = "Rising")
+
+  # Step 1: Prepare predictors (exclude response and phase)
+  predictors <- setdiff(names(data), c(response_var, "phase"))
+
+  # Step 2: Construct formula with interactions
+  main_effects <- paste(predictors, collapse = " + ")
+  interaction_terms <- paste(paste0(predictors, ":phase"), collapse = " + ")
+  formula_string <- paste(response_var, "~", main_effects, "+", interaction_terms)
+
+  # Step 3: Create full design matrix
+  design_matrix <- model.matrix(as.formula(formula_string), data = data)[, -1]
+  response <- data[[response_var]]
+
+  # Step 4: Train/test split
+  train_idx <- sample(1:nrow(data), 0.7 * nrow(data))
+  x_train <- design_matrix[train_idx, ]
+  y_train <- response[train_idx]
+  x_test <- design_matrix[-train_idx, ]
+  y_test <- response[-train_idx]
+
+  # Step 5: Cross-validation with fixed folds
+  foldid <- sample(rep(1:10, length.out = length(y_train)))
+  cvfit <- cv.glmnet(x = x_train, y = y_train, family = "binomial", alpha = 1, foldid = foldid)
+  best_lambda <- cvfit$lambda.min
+
+  # Step 6: Predict on test set
+  pred_prob <- as.vector(predict(cvfit, newx = x_test, s = best_lambda, type = "response"))
+  pred_class <- ifelse(pred_prob > 0.5, 1, 0)
+  acc <- mean(pred_class == y_test)
+  auc_val <- auc(roc(y_test, pred_prob))
+
+  # Step 7: Refit on full data using best lambda
+  final_model <- glmnet(x = design_matrix, y = response, family = "binomial", alpha = 1, lambda = best_lambda)
+  coef_final <- coef(final_model)
+  selected_vars <- rownames(coef_final)[which(coef_final != 0)]
+  selected_vars <- selected_vars[selected_vars != "(Intercept)"]
+
+  # Step 8: Save results
+  results_df <- data.frame(variable = selected_vars)
+  summary_df <- data.frame(metric = c("accuracy", "auc"), value = c(acc, auc_val))
+
+  write.csv(results_df, file = file.path(save_dir, paste0("lasso_selected_", dataset_name, ".csv")), row.names = FALSE)
+  write.csv(summary_df, file = file.path(save_dir, paste0("lasso_summary_", dataset_name, ".csv")), row.names = FALSE)
+
+  # Step 9: Save plots
+  png(filename = file.path(save_dir, paste0("cv_curve_", dataset_name, ".png")), width = 800, height = 600)
+  plot(cvfit, main = paste("LASSO CV -", dataset_name))
+  dev.off()
+
+  png(filename = file.path(save_dir, paste0("auc_curve_", dataset_name, ".png")), width = 800, height = 600)
+  plot(roc(y_test, pred_prob), main = paste("AUC ROC -", dataset_name), col = "blue", lwd = 2)
+  dev.off()
+
+  # Step 10: Return
+  return(list(model = final_model, selected = selected_vars, accuracy = acc, auc = auc_val))
+}
+
+result_lasso_no <- run_lasso_with_interaction(data = prep_no_chol_imputed_2)
+```
+
+## Build Logistic Regression Formula
+
+```{r Build Logistic Regression Formula no}
+# Step 1: extract interaction terms
+lasso_selected_vars_no <- result_lasso_no[["selected"]]
+interaction_vars_no <- grep(":phase", lasso_selected_vars_no, value = TRUE)
+cat("interaction terms from Lasso: \n")
+print(interaction_vars_no)
+
+# Step 2: build logistic regression formula
+# main_effects <- unique(sub(":phase.*", "", interaction_vars))
+
+main_effects_no <- c("cc_acr", "URXUMA", "LBXSGTSI", "LBXSIR", "LBXPLTSI", "LBDSCR", "cc_cvd_mi", "cc_cvd_chd", "cc_cvd_hf", "demo_age_cat", "demo_race", "demo_gender", "htn_resistant_accaha_thz", "cc_diabetes", "cc_ckd", "cc_cvd_any")
+
+interaction_vars_2_no <- paste0(main_effects_no, ":phase")
+
+# all_vars<- unique(c(main_effects, interaction_vars_2))
+# formula_str <- paste("bp_control_accaha ~", paste(all_vars, collapse = " + "))
+
+formula_str_no <- paste("bp_control_accaha ~", paste(interaction_vars_2_no, collapse = " + "))
+
+formula_obj_no <- as.formula(formula_str_no)
+```
+
+## Logistic with weight
+
+Logistics with survey weights, using svyglm(), is intended to make inferences about the population, and representativeness needs to be considered.
+
+```{r Logistic with weight no}
+prep_svy_no <- prep_no_chol_imputed %>%
+  left_join(prep_no_chol %>% select(svy_id, svy_strata, svy_psu, svy_weight_mec), by = "svy_id")
+
+prep_svy_no <- prep_svy_no %>%
+  filter(!is.na(svy_psu) & !is.na(svy_strata) & !is.na(svy_weight_mec))
+
+prep_svy_no <- prep_svy_no %>%
+  mutate(bp_control_accaha = as.integer(bp_control_accaha))
+
+design_no <- svydesign(ids = ~svy_psu,
+                       strata = ~svy_strata,
+                       weights = ~svy_weight_mec,
+                       nest = TRUE,
+                       data = prep_svy_no)
+
+fit_svy_no <- svyglm(formula_obj_no,
+                     design = design_no,
+                     family = binomial())
+
+summary(fit_svy_no)
+
+# save summary
+summary_df_svy_no <- summary(fit_svy_no)$coefficients
+summary_df_svy_no <- as.data.frame(summary_df_svy_no)
+summary_df_svy_no$Variable <- rownames(summary_df_svy_no)
+rownames(summary_df_svy_no) <- NULL
+summary_df_svy_no <- summary_df_svy_no[, c("Variable", "Estimate", "Std. Error", "t value", "Pr(>|t|)")]
+
+write.csv(summary_df_svy_no, "logistic_results_svyglm_interactions_no.csv", row.names = FALSE)
+cat("Survey-weighted logistic summary saved as logistic_results_svyglm_interactions_no.csv\n")
+
+# generate a table
+signif_results_no <- summary_df_svy_no %>%
+  filter(Variable != "(Intercept)", `Pr(>|t|)` <= 0.05) %>%
+  arrange(`Pr(>|t|)`) %>%
+  slice_head(n = 15)
+
+table_without <- signif_results_no %>%
+  gt() %>%
+  fmt_number(columns = c("Estimate", "Std. Error", "t value", "Pr(>|t|)"),
+             decimals = 4) %>%
+  tab_header(
+    title = "Significant Variables Selected from Subset with Cholesterol Data",
+    subtitle = "Variables with p ≤ 0.05"
+  )
+
+gtsave(table_without, filename = "significant_vars_table_no.png")
+```
+
+## trend plot
+
+```{r trend plot no}
+df_no <- prep_no_chol_imputed %>%
+  inner_join(prep_no_chol %>% select(Begin_Year, svy_id), by = "svy_id")
+
+continuous_vars_no <- c("cc_acr", "URXUMA", "LBXSGTSI", "LBXSIR", "LBXPLTSI", "LBDSCR")
+categorical_vars_no <- c("cc_cvd_mi", "cc_cvd_chd", "cc_cvd_hf", "demo_age_cat", "demo_race", "demo_gender", "htn_resistant_accaha_thz", "cc_diabetes", "cc_ckd", "cc_cvd_any")
+
+# Create a save directory
+output_dir_no <- "trend_plots_by_year_no_chol"
+dir.create(output_dir_no, showWarnings = FALSE)
+
+# Continuous variables: mean for each year
+for (var in continuous_vars_no) {
+  p <- df_no %>%
+    group_by(Begin_Year) %>%
+    summarise(mean_val = mean(.data[[var]], na.rm = TRUE)) %>%
+    ggplot(aes(x = Begin_Year, y = mean_val)) +
+    geom_line(color = "black") +
+    geom_point() +
+    geom_vline(xintercept = 2013, linetype = "dashed", color = "red") +
+    labs(title = paste("Trend of", var), y = "Mean", x = "Begin Year") +
+    theme_minimal()
+
+  ggsave(file.path(output_dir_no, paste0("trend_", var, ".png")), plot = p, width = 6, height = 4)
+}
+
+# Categorical variables: the proportion of each level in each year
+for (var in categorical_vars_no) {
+  df_no[[var]] <- as.factor(df_no[[var]])
+  
+  if (var %in% c("demo_age_cat", "demo_race")) {
+    levels_list <- levels(df_no[[var]])
+    
+    for (lvl in levels_list) {
+      trend_df <- df_no %>%
+        filter(!is.na(.data[[var]])) %>%
+        mutate(level_match = (.data[[var]] == lvl)) %>%
+        group_by(Begin_Year) %>%
+        summarise(prop = mean(level_match, na.rm = TRUE))
+      
+      p <- ggplot(trend_df, aes(x = Begin_Year, y = prop)) +
+        geom_line(color = "black") +
+        geom_point() +
+        geom_vline(xintercept = 2013, linetype = "dashed", color = "red") +
+        labs(title = paste("Proportion of", lvl, "in", var), y = "Proportion", x = "Begin Year") +
+        theme_minimal()
+      
+      filename <- paste0("trend_", var, "_", gsub("[^a-zA-Z0-9]", "_", lvl), ".png")
+      ggsave(file.path(output_dir_no, filename), plot = p, width = 6, height = 4)
+    }
+    
+  } else {
+    p <- df_no %>%
+      filter(!is.na(.data[[var]])) %>%
+      group_by(Begin_Year, !!sym(var)) %>%
+      summarise(n = n(), .groups = "drop") %>%
+      group_by(Begin_Year) %>%
+      mutate(prop = n / sum(n)) %>%
+      ggplot(aes(x = Begin_Year, y = prop, color = !!sym(var))) +
+      geom_line() +
+      geom_point() +
+      geom_vline(xintercept = 2013, linetype = "dashed", color = "red") +
+      labs(title = paste("Proportion of", var, "by Year"), y = "Proportion", x = "Begin Year") +
+      theme_minimal()
+    
+    ggsave(file.path(output_dir_no, paste0("trend_", var, ".png")), plot = p, width = 6, height = 4)
+  }  
+}
+```
+
+
+```{r session_info}
+sessionInfo()
+```
